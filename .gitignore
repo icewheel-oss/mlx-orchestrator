@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+.venv/
+
+# Project specifics
+config.json
+opencode.json
+logs/
+
+# IDE files
+.idea/
+.vscode/
+.DS_Store

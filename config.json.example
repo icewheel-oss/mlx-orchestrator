@@ -1,0 +1,37 @@
+{
+  "proxy_port": 12500,
+  "scan_interval_seconds": 5,
+  "scan_ports_min": 12501,
+  "scan_ports_max": 12520,
+  "api_key": null,
+  "log_token_usage": true,
+  "global_opencode": false,
+  "ssl_certfile": null,
+  "ssl_keyfile": null,
+  "managed_servers": [
+    {
+      "model": "mlx-community/gemma-4-e2b-it-4bit",
+      "port": 12501,
+      "type": "vlm",
+      "enabled": true
+    },
+    {
+      "model": "mlx-community/gemma-4-e4b-it-4bit",
+      "port": 12502,
+      "type": "vlm",
+      "enabled": false
+    },
+    {
+      "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+      "port": 12503,
+      "type": "lm",
+      "enabled": false
+    },
+    {
+      "model": "mlx-community/gemma-4-31b-bf16",
+      "port": 12504,
+      "type": "vlm",
+      "enabled": false
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local-mlx": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "MLX Local Server",
+      "options": {
+        "baseURL": "http://127.0.0.1:12500/v1",
+        "headers": {
+          "Authorization": "Bearer your-secret-key"
+        }
+      },
+      "models": {
+        "mlx-community/gemma-4-e2b-it-4bit": {
+          "name": "Gemma 4 2B Instruct (4-bit)"
+        },
+        "mlx-community/gemma-4-e4b-it-4bit": {
+          "name": "Gemma 4 4B Instruct (4-bit)"
+        },
+        "mlx-community/Qwen3.6-35B-A3B-4bit": {
+          "name": "Qwen 3.6 35B A3B (4-bit)"
+        },
+        "mlx-community/gemma-4-31b-bf16": {
+          "name": "Gemma 4 31B (BF16)"
+        }
+      }
+    }
+  }
+}
