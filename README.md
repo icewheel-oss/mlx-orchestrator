@@ -55,6 +55,9 @@ When you first run the server, a default `config.json` will be generated in your
   "scan_ports_max": 12520,
   "api_key": null,
   "log_token_usage": true,
+  "global_opencode": false,
+  "debug_mode": false,
+  "max_log_size_bytes": 10485760,
   "ssl_certfile": null,
   "ssl_keyfile": null,
   "managed_servers": [
@@ -90,6 +93,8 @@ When you first run the server, a default `config.json` will be generated in your
 * **Security (`api_key`):** Set this to a string (e.g. `"my-secret-key"`) to require authorization. Clients must then supply the `Authorization: Bearer <key>` header. Set to `null` to disable auth (default).
 * **Observability (`log_token_usage`):** Set to `true` (default) to output token metrics (prompt size, generated tokens, tokens/sec generation speed, and elapsed time) to the proxy's terminal after every streaming/non-streaming completion.
 * **Global OpenCode Config (`global_opencode`):** Set to `true` to generate the OpenCode configuration profile globally at `~/.opencode/opencode.json` in addition to the project directory. Defaults to `false`.
+* **Debug Mode (`debug_mode`):** Set to `true` to log all incoming request headers, query parameters, payloads, downstream requests, downstream response status/headers, streaming chunks in real-time, and non-streaming bodies (with sensitive `Authorization` headers masked). Defaults to `false`.
+* **Log Limits (`max_log_size_bytes`):** Maximum size in bytes (default: `10485760` / 10MB) before rotating logs to `.log.1` on startup or truncating active model server log files in-place during runtime.
 * **HTTPS/SSL (`ssl_certfile` & `ssl_keyfile`):** Provide paths to your `.pem` / `.crt` certificate and key files to serve the proxy securely over HTTPS. Defaults to `null` (plain HTTP).
 * **Types:** Use `"lm"` or `"vlm"` depending on the model's architecture:
   * **`lm` (Language Model):** Text-only models. Runs under the `mlx-lm` backend wrapper. Best for coding, text chat, and reasoning (e.g. Qwen 3.6, Llama 3.1, DeepSeek Distill).
@@ -126,7 +131,6 @@ Now, configure your client applications (like OpenCode or Goose) to point to the
    - Open the **AI Chat window** inside IntelliJ IDEA.
    - Choose **OpenCode Agent** from the list of agents.
    - The agent will connect to your local MLX Orchestrator, dynamically listing all of your active models!
-
 ---
 
 ## 🛠️ CLI Commands
@@ -141,9 +145,9 @@ positional arguments:
 
 ### Serve
 ```bash
-python orchestrator.py serve [--port PORT] [--global-opencode]
+python orchestrator.py serve [--port PORT] [--global-opencode] [--debug]
 ```
-Starts the FastAPI routing proxy and process watchdog. *During startup, it will run a diagnostic check on your physical RAM vs the size of enabled models and print a warning if you exceed safe limits (70% of total unified memory). The `--global-opencode` flag writes the OpenCode configuration profile globally at `~/.opencode/opencode.json`.*
+Starts the FastAPI routing proxy and process watchdog. *During startup, it will run a diagnostic check on your physical RAM vs the size of enabled models and print a warning if you exceed safe limits (70% of total unified memory). The `--global-opencode` flag writes the OpenCode configuration profile globally at `~/.opencode/opencode.json`. The `--debug` flag activates verbose request/response logging to terminal stdout.*
 
 ### Download
 ```bash
@@ -159,20 +163,62 @@ Checks your Mac's total Unified Memory, lists the exact size on disk of all conf
 
 ---
 
+## ⚙️ Advanced Features & Architecture
+
+### 1. Interactive API Playground (Swagger UI)
+Since the [orchestrator.py](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/orchestrator.py) server is built on top of the **FastAPI** web framework, it hosts automatic interactive OpenAPI documentation:
+- **Access URL:** Simply open your web browser and navigate to the proxy root (e.g., `http://127.0.0.1:12500/`).
+- **Redirect behavior:** The root URL automatically redirects you to `/docs` (e.g., `http://127.0.0.1:12500/docs`), which renders the Swagger UI.
+- **Use case:** You can interactively test the routing proxy endpoints (like `GET /v1/models` or `POST /v1/chat/completions`), review the required JSON schemas, and test authorized requests by setting your `api_key` using the **Authorize** button.
+
+### 2. Verbose Debug Mode & Security Masking
+When diagnosing connection errors, custom client configurations, or token-generation bugs, you can enable verbose request/response logging:
+- **How to enable:**
+  - Set `"debug_mode": true` in [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json), OR
+  - Run the server command with the `--debug` CLI flag (`python orchestrator.py serve --debug`).
+- **What it logs:**
+  - **Client Request Headers:** Displays incoming headers (with the sensitive `Authorization` token automatically masked as `Bearer ********` to prevent security leaks).
+  - **Request Body & Parameters:** Logs query parameters and raw JSON payloads sent by client IDEs/applications.
+  - **Downstream Requests:** Prints the exact backend server port and URL target for routed payloads.
+  - **Downstream Responses:** Logs HTTP response status code, response headers, and non-streaming response body.
+  - **Real-Time Stream Chunks:** Prints individual event-stream chunks (e.g., `data: {...}`) as they arrive from downstream servers.
+  - **Uvicorn Access Logs:** Automatically enables `access_log` in Uvicorn to trace every HTTP transaction.
+
+### 3. Automated Log Rotation & In-Place Active Truncation
+Because running large language models generates substantial output logs during load and evaluation, MLX Orchestrator prevents log files from consuming all your disk space:
+- **Startup Rotation:** Whenever a backend model server starts, the orchestrator checks if its existing log in `logs/{model_name}.log` exceeds the `"max_log_size_bytes"` limit (default: 10MB). If it does, it moves the file to `logs/{model_name}.log.1`, overwriting any previous backup.
+- **Runtime Active Truncation:** While the model is running, the background watchdog thread continuously monitors active log files. If a log exceeds the limit at runtime, the watchdog calls Python's `truncate(0)` on the open file handle. This resets the log file size to 0 bytes dynamically in-place **without** closing the stream or restarting the backend process, protecting your disk space while maintaining open file handles.
+
+### 4. Gemma 4 & Strict-Override weight compatibility
+- **The Issue:** Newer architectures (like Gemma 4) include redundant Key-Value parameters or slightly mismatched weights structures compared to standard base architectures. Loading these models using raw CLI tools (`mlx-lm.server` or `mlx-vlm.server`) often throws a strict schema validation exception, preventing the server from starting.
+- **The Solution:** Inside its process manager [monitor_and_scan_loop](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/orchestrator.py#L231), the MLX Orchestrator dynamically wraps weight loading by monkeypatching the MLX weight loader (`mlx.nn.Module.load_weights`) to execute with `strict=False`. This transparently enables out-of-the-box support for Gemma 4 models and other advanced architectures without requiring manual codebase modifications or model-conversion hacks.
+
+### 5. Graceful Self-Healing Config Management
+The orchestrator reads and updates its state from [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json) every 5 seconds:
+- **Typo Tolerance:** If you make a syntax error (such as a missing bracket, comma, or quotation mark) while editing [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json) during server runtime, the config loader [load_config](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/orchestrator.py#L93) will catch the exception, output a clean warning to the terminal logs, and fall back to the last valid settings or default values.
+- **Auto-Reloading:** The orchestrator will not crash. Once you fix the typo in [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json) and save, it will automatically detect and load the updated settings on the very next background cycle.
+
+---
+
 ## 🗂️ Logs
-To keep your terminal clean, the stdout/stderr outputs of all managed model processes are routed to log files in the `logs/` directory:
-- `logs/mlx-community_Qwen3.6-35B-A3B-4bit.log`
-- `logs/mlx-community_gemma-4-31b-bf16.log`
+
+The MLX Orchestrator separates its logs to keep your terminal output readable:
+1. **Gateway Logs (Terminal stdout):** Shows orchestrator startup, configuration updates, active port scans, API routing targets, request forwarding, token usage statistics, and debug output.
+2. **Model Process Logs (`logs/` directory):** The raw stdout and stderr outputs of each managed backend subprocess are routed to dedicated files under `logs/`.
+   - File format: `logs/<org>_<model_name>.log` (e.g., `logs/mlx-community_Qwen3.6-35B-A3B-4bit.log`).
+   - If a model fails to start or crashes, **always check these files first** to see the python traceback from the underlying server wrapper.
+
+---
 
 ## 🚨 Troubleshooting & Handling Failures
 
-Here is how to solve common issues you might encounter:
+Here is how to diagnose and resolve issues you might encounter:
 
 ### 1. Extremely slow response speeds / Mac runs very hot
 * **Symptom:** Tokens generate very slowly (1-2 tokens per second), your Mac's fans spin up loudly, and your CPU goes to 100% load.
 * **Cause:** The model is too large for your GPU memory limit, forcing macOS to run the model on the CPU instead.
 * **Solution:** 
-  1. Run the diagnostics tool to inspect your system limits:
+  1. Run the diagnostics tool [recommend_models](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/orchestrator.py#L857) to inspect your system limits:
      ```bash
      python orchestrator.py recommend
      ```
@@ -221,21 +267,34 @@ Here is how to solve common issues you might encounter:
     # 2. Kill the process using its PID
     kill -9 <PID_NUMBER>
     ```
-  * You can also change the proxy port by opening `config.json` and changing `"proxy_port": 12500` to a different number (e.g. `13500`).
+  * You can also change the proxy port by opening [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json) and changing `"proxy_port": 12500` to a different number (e.g. `13500`).
 
 ### 4. Model download fails or hangs
 * **Symptom:** The `download` command times out or gets cut off due to network disconnection.
-* **Solution:** Simply re-run the download command. Hugging Face downloads are fully resumable and will pick up right where they left off.
+* **Cause:** Unstable network or Hugging Face Hub rate limits.
+* **Solution:** Re-run the download command. Hugging Face downloads are fully resumable; they query local cache files and download only the missing chunks.
 
-### 5. Backend model fails to start
-* **Symptom:** Proxy starts, but requests for a specific model fail with a `503 Service Unavailable` error.
-* **Solution:** Check the log files in the `logs/` directory (e.g., `logs/mlx-community_Qwen3.6-35B-A3B-4bit.log`) to read the exact traceback. Common causes include:
-  * Typo in the model name in your config file.
-  * Trying to run a standard PyTorch model instead of an MLX-converted format (make sure it has `mlx` in the name).
+### 5. Backend model fails to start / Service Unavailable (503)
+* **Symptom:** Requests for a specific model return a `503 Service Unavailable` error, or the model fails to load.
+* **Solution:**
+  1. Check the logs in the `logs/` directory for the specific model (e.g., `logs/mlx-community_Qwen3.6-35B-A3B-4bit.log`).
+  2. If the log file is empty or does not exist, the process might have failed before writing output. Verify:
+     - The model name is exactly correct in [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json).
+     - The model is download-complete (has weights and a config in Hugging Face cache).
+     - You have `mlx-lm` or `mlx-vlm` installed (run `pip show mlx-lm mlx-vlm` to confirm).
+  3. If you see a python traceback inside the model's log:
+     - **Out of Memory:** The weights size exceeds system capacity. Disable unused models in [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json) and adjust `sysctl iogpu.wired_limit_mb` as shown in step 1.
+     - **Mismatched architecture:** Ensure the model is converted to MLX format (model name contains `mlx`). The orchestrator does not serve raw PyTorch models directly.
 
 ### 6. Typo or malformed settings in `config.json`
 * **Symptom:** You made a typo or entered malformed settings in `config.json` while the orchestrator was running.
-* **Solution:** The MLX Orchestrator is designed to be fully self-healing and gracefully handles malformed syntax (e.g., incorrect JSON brackets) or schema errors (e.g., missing dictionary entries or type mismatches). It will output a clean warning to the terminal logs and safely fall back to the last valid settings or defaults without crashing. Simply correct the typo in `config.json` and it will auto-load your corrections dynamically in the next background cycle (every 5 seconds).
+* **Solution:** The MLX Orchestrator is designed to be fully self-healing. It will output a clean warning to the terminal logs and safely fall back to the last valid settings or defaults without crashing. Correct the typo in [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json), and it will auto-load your corrections dynamically in the next background cycle (every 5 seconds).
+
+### 7. Interactive API docs (Swagger UI) failing to load
+* **Symptom:** Navigating to `http://127.0.0.1:12500/` or `/docs` returns a connection error in the browser.
+* **Solution:**
+  - Confirm that the MLX Orchestrator process is running in the terminal.
+  - Check if you have enabled HTTPS/SSL in [config.json](file:///Users/tony/programming/workspace/oss/ai/mlx-orchestrator/config.json) (by setting `"ssl_certfile"` and `"ssl_keyfile"`). If HTTPS is enabled, you must access the API using `https://127.0.0.1:12500/` instead of `http`.
 
 ---
 

@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
     "api_key": None,
     "log_token_usage": True,
     "global_opencode": False,
+    "debug_mode": False,
+    "max_log_size_bytes": 10485760,  # Limit logs to 10MB by default
     "ssl_certfile": None,
     "ssl_keyfile": None,
     "managed_servers": [
@@ -82,8 +84,9 @@ DEFAULT_CONFIG = {
 # Global state
 MODEL_ROUTES = {}         # model_id -> backend_url (updated by port scanner)
 DISCOVERED_MODELS = {}    # model_id -> original model JSON metadata
-RUNNING_PROCESSES = {}    # model_name -> (subprocess.Popen, log_file_handle)
+RUNNING_PROCESSES = {}    # model_name -> (subprocess.Popen, log_file_handle, log_file_path)
 GLOBAL_OPENCODE_OVERRIDE = None
+GLOBAL_DEBUG_OVERRIDE = None
 
 client = None
 
@@ -263,7 +266,7 @@ async def monitor_and_scan_loop(interval):
             for model_name in list(RUNNING_PROCESSES.keys()):
                 enabled, _, _ = desired_enabled.get(model_name, (False, None, None))
                 if not enabled:
-                    proc, log_file = RUNNING_PROCESSES[model_name]
+                    proc, log_file, _ = RUNNING_PROCESSES[model_name]
                     logger.info(f"Stopping model '{model_name}' (PID: {proc.pid}) as it was disabled in config...")
                     proc.terminate()
                     try:
@@ -282,9 +285,18 @@ async def monitor_and_scan_loop(interval):
                 is_running = False
                 
                 if proc_info:
-                    proc, log_file = proc_info
+                    proc, log_file, log_file_path = proc_info
                     if proc.poll() is None:
                         is_running = True
+                        # Check log file size and truncate in-place if it exceeds limit
+                        max_log_size = config.get("max_log_size_bytes", 10 * 1024 * 1024)
+                        try:
+                            if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > max_log_size:
+                                with open(log_file_path, "r+") as f:
+                                    f.truncate(0)
+                                logger.info(f"Truncated active log file {log_file_path} for model '{model_name}' (exceeded {max_log_size} bytes)")
+                        except Exception as e:
+                            logger.error(f"Failed to truncate active log file for model '{model_name}': {e}")
                     else:
                         logger.warning(f"Model server '{model_name}' (port {port}) terminated unexpectedly with exit code {proc.poll()}. Restarting...")
                         log_file.close()
@@ -324,6 +336,18 @@ async def monitor_and_scan_loop(interval):
                     safe_name = model_name.replace("/", "_")
                     log_file_path = os.path.join(LOGS_DIR, f"{safe_name}.log")
                     
+                    # Rotate old log on startup if it exceeds the limit
+                    max_log_size = config.get("max_log_size_bytes", 10 * 1024 * 1024)
+                    if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > max_log_size:
+                        backup_path = log_file_path + ".1"
+                        try:
+                            if os.path.exists(backup_path):
+                                os.remove(backup_path)
+                            os.rename(log_file_path, backup_path)
+                            logger.info(f"Rotated log file {log_file_path} to {backup_path} (exceeded {max_log_size} bytes)")
+                        except Exception as e:
+                            logger.error(f"Failed to rotate log file {log_file_path}: {e}")
+                    
                     try:
                         log_file = open(log_file_path, "a")
                         proc = subprocess.Popen(
@@ -332,7 +356,7 @@ async def monitor_and_scan_loop(interval):
                             stderr=log_file,
                             start_new_session=True
                         )
-                        RUNNING_PROCESSES[model_name] = (proc, log_file)
+                        RUNNING_PROCESSES[model_name] = (proc, log_file, log_file_path)
                         logger.info(f"Launched model '{model_name}' on port {port} (PID: {proc.pid}, Logs: logs/{safe_name}.log)")
                     except Exception as e:
                         logger.error(f"Failed to launch model '{model_name}': {e}")
@@ -391,7 +415,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down... Cleaning up background model servers...")
     monitor_task.cancel()
     
-    for model_name, (proc, log_file) in RUNNING_PROCESSES.items():
+    for model_name, (proc, log_file, _) in RUNNING_PROCESSES.items():
         logger.info(f"Terminating subprocess for model '{model_name}' (PID: {proc.pid})...")
         proc.terminate()
         try:
@@ -460,9 +484,18 @@ async def redirect_to_swagger():
 @app.get("/v1/models")
 async def list_models(api_key: str = Security(verify_api_key)):
     """Unified models endpoint."""
+    config = load_config()
+    debug_mode = GLOBAL_DEBUG_OVERRIDE if GLOBAL_DEBUG_OVERRIDE is not None else config.get("debug_mode", False)
+    
+    models_data = list(DISCOVERED_MODELS.values())
+    if debug_mode:
+        logger.info(
+            f"🔍 [DEBUG REQUEST] GET /v1/models endpoint called.\n"
+            f"🔍 [DEBUG RESPONSE] GET /v1/models returning: {json.dumps(models_data)}"
+        )
     return {
         "object": "list",
-        "data": list(DISCOVERED_MODELS.values())
+        "data": models_data
     }
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -509,12 +542,26 @@ async def route_request(request: Request, path: str, api_key: str = Security(ver
             }
         )
 
-    # Load usage logging preference
+    # Load preferences
     config = load_config()
     log_token_usage = config.get("log_token_usage", True)
+    debug_mode = GLOBAL_DEBUG_OVERRIDE if GLOBAL_DEBUG_OVERRIDE is not None else config.get("debug_mode", False)
 
     target_url = f"{backend_url}/v1/{path}"
     logger.info(f"Routing request for model '{model_name}' -> {target_url}")
+
+    # Log incoming request in debug mode (mask sensitive Authorization headers)
+    if debug_mode:
+        masked_headers = dict(request.headers)
+        if "authorization" in masked_headers:
+            masked_headers["authorization"] = "Bearer " + "*" * 8
+        logger.info(
+            f"🔍 [DEBUG REQUEST] Routing from client:\n"
+            f"  Method:  {request.method} /v1/{path}\n"
+            f"  Headers: {masked_headers}\n"
+            f"  Params:  {dict(request.query_params)}\n"
+            f"  Body:    {body.decode('utf-8', errors='ignore')}"
+        )
 
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -531,6 +578,13 @@ async def route_request(request: Request, path: str, api_key: str = Security(ver
         
         start_time = time.time()
         downstream_response = await client.send(proxy_req, stream=True)
+
+        if debug_mode:
+            logger.info(
+                f"🔍 [DEBUG RESPONSE] Downstream Response metadata:\n"
+                f"  Status:  {downstream_response.status_code}\n"
+                f"  Headers: {dict(downstream_response.headers)}"
+            )
         
         if downstream_response.headers.get("content-type") == "text/event-stream" or downstream_response.status_code == 200:
             async def generate_chunks():
@@ -538,10 +592,18 @@ async def route_request(request: Request, path: str, api_key: str = Security(ver
                 total_prompt_tokens = 0
                 chunk_token_count = 0
                 buffer = ""
+                is_event_stream = downstream_response.headers.get("content-type") == "text/event-stream"
+                accumulated_body = []
                 
                 try:
                     async for chunk in downstream_response.aiter_bytes():
                         yield chunk
+                        
+                        if debug_mode:
+                            if is_event_stream:
+                                logger.info(f"🔍 [DEBUG STREAM CHUNK] {len(chunk)} bytes: {chunk.decode('utf-8', errors='ignore')}")
+                            else:
+                                accumulated_body.append(chunk.decode('utf-8', errors='ignore'))
                         
                         if log_token_usage:
                             # Accumulate bytes in buffer to parse complete lines
@@ -571,6 +633,11 @@ async def route_request(request: Request, path: str, api_key: str = Security(ver
                                     except Exception:
                                         pass
                 finally:
+                    if debug_mode and not is_event_stream and accumulated_body:
+                        logger.info(
+                            f"🔍 [DEBUG RESPONSE] Downstream Non-streaming body:\n"
+                            f"  Body: {''.join(accumulated_body)}"
+                        )
                     await downstream_response.aclose()
                     
                     # Log usage metrics
@@ -599,6 +666,12 @@ async def route_request(request: Request, path: str, api_key: str = Security(ver
         else:
             await downstream_response.aread()
             
+            if debug_mode:
+                logger.info(
+                    f"🔍 [DEBUG RESPONSE] Downstream Non-streaming body:\n"
+                    f"  Body: {downstream_response.content.decode('utf-8', errors='ignore')}"
+                )
+
             # Log usage metrics for non-streaming response
             if log_token_usage:
                 elapsed = time.time() - start_time
@@ -843,10 +916,11 @@ def recommend_models():
     print("    sudo sysctl iogpu.wired_limit_mb=0")
     print("=" * 60)
 
-def run_server(port_override=None, global_opencode=False):
+def run_server(port_override=None, global_opencode=False, debug=False):
     """Launches the orchestrator proxy server with optional SSL/HTTPS."""
-    global GLOBAL_OPENCODE_OVERRIDE
+    global GLOBAL_OPENCODE_OVERRIDE, GLOBAL_DEBUG_OVERRIDE
     GLOBAL_OPENCODE_OVERRIDE = global_opencode
+    GLOBAL_DEBUG_OVERRIDE = debug
     
     config = load_config()
     port = port_override or config.get("proxy_port", 12500)
@@ -861,14 +935,18 @@ def run_server(port_override=None, global_opencode=False):
     ssl_certfile = config.get("ssl_certfile")
     ssl_keyfile = config.get("ssl_keyfile")
     
-    logger.info(f"Starting MLX Orchestrator on port {port}...")
+    debug_mode = debug or config.get("debug_mode", False)
+    logger.info(f"Starting MLX Orchestrator on port {port} (access logs: {'enabled' if debug_mode else 'disabled'})...")
+    if debug_mode:
+        logger.info("🔍 Debug logging mode is active. Request/response details will be logged.")
     
     # Build uvicorn arguments dynamically
     uvicorn_kwargs = {
         "app": app,
         "host": "127.0.0.1",
         "port": port,
-        "reload": False
+        "reload": False,
+        "access_log": debug_mode
     }
     
     if ssl_certfile and ssl_keyfile:
@@ -895,6 +973,7 @@ Examples:
   python orchestrator.py serve
   python orchestrator.py serve --port 12500
   python orchestrator.py serve --global-opencode
+  python orchestrator.py serve --debug
   python orchestrator.py download mlx-community/gemma-4-31b-bf16
   python orchestrator.py recommend
         """
@@ -905,6 +984,7 @@ Examples:
     serve_parser = subparsers.add_parser("serve", help="Start the orchestrator proxy and managed MLX servers")
     serve_parser.add_argument("--port", type=int, help="Override proxy port (defaults to config value or 12500)")
     serve_parser.add_argument("--global-opencode", action="store_true", help="Generate the OpenCode configuration profile globally at ~/.opencode/opencode.json")
+    serve_parser.add_argument("--debug", action="store_true", help="Enable debug logging of request/response interactions")
     
     # Download Parser
     download_parser = subparsers.add_parser("download", help="Pre-download a model from Hugging Face")
@@ -918,7 +998,7 @@ Examples:
     if args.command == "download":
         download_model(args.model_id)
     elif args.command == "serve":
-        run_server(args.port, args.global_opencode)
+        run_server(args.port, args.global_opencode, args.debug)
     elif args.command == "recommend":
         recommend_models()
     else:

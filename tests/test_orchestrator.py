@@ -539,5 +539,180 @@ def test_malformed_config_handling_gracefully(mock_config_dir):
     orchestrator.write_opencode_config(malformed_config_3)
     orchestrator.check_memory_limits(malformed_config_3)
 
+@pytest.mark.asyncio
+@patch("orchestrator.client")
+@patch("orchestrator.load_config")
+async def test_debug_mode_logging(mock_load_config, mock_http_client, caplog):
+    """
+    Verifies that enabling debug mode logs request and response interactions.
+    """
+    mock_load_config.return_value = {
+        "debug_mode": True,
+        "managed_servers": []
+    }
+    
+    orchestrator.MODEL_ROUTES = {
+        "model-qwen": "http://127.0.0.1:12501"
+    }
+
+    # Setup mock HTTP response for downstream calls
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "application/json"}
+    mock_response.content = b'{"choices":[{"text":"output-text"}]}'
+    mock_response.aread = AsyncMock()
+    mock_response.aclose = AsyncMock()
+    
+    async def mock_aiter_bytes():
+        yield mock_response.content
+    mock_response.aiter_bytes = mock_aiter_bytes
+    
+    async def mock_send(req, stream=False):
+        return mock_response
+    mock_http_client.send = mock_send
+    mock_http_client.build_request.return_value = MagicMock()
+
+    client = TestClient(orchestrator.app)
+    
+    # Clean override state
+    orchestrator.GLOBAL_DEBUG_OVERRIDE = None
+    
+    with caplog.at_level("INFO"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-qwen", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        
+    assert response.status_code == 200
+    
+    # Assertions for debug mode logs:
+    assert any("[DEBUG REQUEST] Routing from client" in record.message for record in caplog.records)
+    assert any("[DEBUG RESPONSE] Downstream Response metadata" in record.message for record in caplog.records)
+    assert any("[DEBUG RESPONSE] Downstream Non-streaming body" in record.message for record in caplog.records)
+
+@pytest.mark.asyncio
+@patch("orchestrator.client")
+@patch("orchestrator.load_config")
+async def test_debug_mode_logging_streaming(mock_load_config, mock_http_client, caplog):
+    """
+    Verifies that enabling debug mode logs stream chunks in a streaming response.
+    """
+    mock_load_config.return_value = {
+        "debug_mode": True,
+        "managed_servers": []
+    }
+    
+    orchestrator.MODEL_ROUTES = {
+        "model-qwen": "http://127.0.0.1:12501"
+    }
+
+    # Setup mock HTTP response for streaming downstream calls
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "text/event-stream"}
+    mock_response.aread = AsyncMock()
+    mock_response.aclose = AsyncMock()
+    
+    async def mock_aiter_bytes():
+        yield b'data: {"choices": [{"delta": {"content": "chunk-1"}}]}\n\n'
+    mock_response.aiter_bytes = mock_aiter_bytes
+
+    async def mock_send(req, stream=False):
+        return mock_response
+    mock_http_client.send = mock_send
+    mock_http_client.build_request.return_value = MagicMock()
+
+    client = TestClient(orchestrator.app)
+    
+    # Clean override state
+    orchestrator.GLOBAL_DEBUG_OVERRIDE = None
+    
+    with caplog.at_level("INFO"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "model-qwen"}
+        )
+        
+    assert response.status_code == 200
+    assert b"chunk-1" in response.content
+    
+    # Assertions for debug stream logging:
+    assert any("[DEBUG REQUEST] Routing from client" in record.message for record in caplog.records)
+    assert any("[DEBUG RESPONSE] Downstream Response metadata" in record.message for record in caplog.records)
+    assert any("[DEBUG STREAM CHUNK]" in record.message for record in caplog.records)
+
+@pytest.mark.asyncio
+async def test_log_file_rotation_and_truncation(monkeypatch, tmp_path):
+    import asyncio
+    # Setup config path and temporary file
+    temp_config = tmp_path / "config.json"
+    monkeypatch.setattr(orchestrator, "CONFIG_PATH", str(temp_config))
+    
+    config_data = {
+        "proxy_port": 12500,
+        "scan_interval_seconds": 0.1,
+        "max_log_size_bytes": 10,
+        "managed_servers": [
+            {
+                "model": "test-model-rotation",
+                "port": 12501,
+                "type": "lm",
+                "enabled": True
+            }
+        ]
+    }
+    with open(temp_config, "w") as f:
+        json.dump(config_data, f)
+        
+    # Setup log directory and file
+    log_dir = tmp_path / "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    monkeypatch.setattr(orchestrator, "LOGS_DIR", str(log_dir))
+    
+    log_path = log_dir / "test-model-rotation.log"
+    with open(log_path, "w") as f:
+        f.write("A" * 15)  # 15 bytes exceeds 10 bytes limit
+        
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # running
+    
+    with patch("subprocess.Popen", return_value=mock_proc):
+        async def mock_sleep(delay):
+            raise ValueError("stop loop")
+            
+        monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+        
+        with patch("httpx.AsyncClient.get", side_effect=Exception("mocked offline")):
+            try:
+                await orchestrator.monitor_and_scan_loop(0.1)
+            except ValueError as e:
+                assert str(e) == "stop loop"
+                
+    backup_path = str(log_path) + ".1"
+    assert os.path.exists(backup_path)
+    with open(backup_path, "r") as f:
+        assert f.read() == "A" * 15
+        
+    # Test active truncation
+    mock_file_handle = open(log_path, "a")
+    mock_file_handle.write("B" * 20)
+    mock_file_handle.flush()
+    
+    orchestrator.RUNNING_PROCESSES = {
+        "test-model-rotation": (mock_proc, mock_file_handle, str(log_path))
+    }
+    
+    with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("httpx.AsyncClient.get", side_effect=Exception("mocked offline")):
+            try:
+                await orchestrator.monitor_and_scan_loop(0.1)
+            except ValueError as e:
+                assert str(e) == "stop loop"
+                
+    mock_file_handle.close()
+    assert os.path.exists(log_path)
+    assert os.path.getsize(log_path) == 0
+
+
 
 

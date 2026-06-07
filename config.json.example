@@ -6,6 +6,8 @@
   "api_key": null,
   "log_token_usage": true,
   "global_opencode": false,
+  "debug_mode": false,
+  "max_log_size_bytes": 10485760,
   "ssl_certfile": null,
   "ssl_keyfile": null,
   "managed_servers": [
