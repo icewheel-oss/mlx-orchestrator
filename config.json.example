@@ -27,7 +27,9 @@
       "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
       "port": 12503,
       "type": "lm",
-      "enabled": false
+      "enabled": false,
+      "temperature": 0.3,
+      "faster_model": "mlx-community/gemma-4-e2b-it-4bit"
     },
     {
       "model": "mlx-community/gemma-4-31b-bf16",

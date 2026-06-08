@@ -426,13 +426,118 @@ def test_write_global_opencode_config_by_override(mock_config_dir, monkeypatch):
     # Reset override state
     orchestrator.GLOBAL_OPENCODE_OVERRIDE = None
 
+def test_write_junie_config(mock_config_dir):
+    """Verifies that write_junie_config generates the correct Junie profile json content."""
+    config = {
+        "proxy_port": 12500,
+        "api_key": "test-key",
+        "managed_servers": [
+            {
+                "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+                "port": 12503,
+                "type": "lm",
+                "enabled": True,
+                "temperature": 0.3,
+                "faster_model": "mlx-community/custom-helper"
+            },
+            {
+                "model": "mlx-community/gemma-4-e4b-it-4bit",
+                "port": 12502,
+                "type": "vlm",
+                "enabled": True
+            },
+            {
+                "model": "mlx-community/gemma-4-e2b-it-4bit",
+                "port": 12501,
+                "type": "vlm",
+                "enabled": True
+            }
+        ]
+    }
+    
+    orchestrator.write_junie_config(config)
+    
+    junie_local_dir = os.path.join(os.path.dirname(orchestrator.CONFIG_PATH), ".junie", "models")
+    qwen_profile_path = os.path.join(junie_local_dir, "mlx-qwen3.6-35b-a3b-4bit.json")
+    gemma4_profile_path = os.path.join(junie_local_dir, "mlx-gemma-4-e4b-it-4bit.json")
+    gemma2_profile_path = os.path.join(junie_local_dir, "mlx-gemma-4-e2b-it-4bit.json")
+    
+    assert os.path.exists(qwen_profile_path)
+    assert os.path.exists(gemma4_profile_path)
+    assert os.path.exists(gemma2_profile_path)
+    
+    # 1. Assert Qwen profile (explicitly configured)
+    with open(qwen_profile_path, "r") as f:
+        qwen_data = json.load(f)
+    assert qwen_data["baseUrl"] == "http://127.0.0.1:12500/v1"
+    assert qwen_data["id"] == "mlx-community/Qwen3.6-35B-A3B-4bit"
+    assert qwen_data["apiType"] == "OpenAICompletion"
+    assert qwen_data["apiKey"] == "test-key"
+    assert qwen_data["temperature"] == 0.3
+    assert qwen_data["primaryModel"] == {
+        "id": "mlx-community/Qwen3.6-35B-A3B-4bit",
+        "temperature": 0.3
+    }
+    assert qwen_data["fasterModel"] == {
+        "id": "mlx-community/custom-helper"
+    }
+    
+    # 2. Assert Gemma-4B profile (auto-detects Gemma-2B as faster)
+    with open(gemma4_profile_path, "r") as f:
+        gemma4_data = json.load(f)
+    assert gemma4_data["id"] == "mlx-community/gemma-4-e4b-it-4bit"
+    assert "temperature" not in gemma4_data
+    assert gemma4_data["primaryModel"] == {
+        "id": "mlx-community/gemma-4-e4b-it-4bit"
+    }
+    assert gemma4_data["fasterModel"] == {
+        "id": "mlx-community/gemma-4-e2b-it-4bit"
+    }
+    
+    # 3. Assert Gemma-2B profile (no active model is smaller, so no fasterModel)
+    with open(gemma2_profile_path, "r") as f:
+        gemma2_data = json.load(f)
+    assert gemma2_data["id"] == "mlx-community/gemma-4-e2b-it-4bit"
+    assert "fasterModel" not in gemma2_data
+
+def test_write_global_junie_config(mock_config_dir, monkeypatch):
+    """Verifies that write_junie_config generates global Junie profiles when global_opencode is enabled."""
+    config = {
+        "proxy_port": 12500,
+        "global_opencode": True,
+        "managed_servers": [
+            {
+                "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+                "port": 12503,
+                "type": "lm",
+                "enabled": True
+            }
+        ]
+    }
+    
+    temp_global_dir = os.path.join(mock_config_dir["base"], "global_junie_dir")
+    monkeypatch.setattr(os.path, "expanduser", lambda path: os.path.join(temp_global_dir, "models") if path == "~/.junie/models" else path)
+
+    # Clean override state
+    orchestrator.GLOBAL_OPENCODE_OVERRIDE = None
+
+    orchestrator.write_junie_config(config)
+    
+    global_profile_path = os.path.join(temp_global_dir, "models", "mlx-qwen3.6-35b-a3b-4bit.json")
+    assert os.path.exists(global_profile_path)
+    
+    with open(global_profile_path, "r") as f:
+        data = json.load(f)
+    assert data["baseUrl"] == "http://127.0.0.1:12500/v1"
+
 @pytest.mark.asyncio
 @patch("orchestrator.load_config")
 @patch("orchestrator.write_opencode_config")
+@patch("orchestrator.write_junie_config")
 @patch("subprocess.Popen")
 @patch("asyncio.sleep")
 async def test_monitor_and_scan_loop_manages_subprocesses(
-    mock_sleep, mock_popen, mock_write_config, mock_load_config
+    mock_sleep, mock_popen, mock_write_junie_config, mock_write_config, mock_load_config
 ):
     """
     Verifies that monitor_and_scan_loop dynamically starts enabled servers,

@@ -94,7 +94,9 @@ DEFAULT_CONFIG = {
             "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
             "port": 12503,
             "type": "lm",
-            "enabled": False
+            "enabled": False,
+            "temperature": 0.3,
+            "faster_model": "mlx-community/gemma-4-e2b-it-4bit"
         },
         {
             "model": "mlx-community/gemma-4-31b-bf16",
@@ -252,6 +254,170 @@ def write_opencode_config(config, port=None):
             except Exception as e:
                 logger.error(f"Failed to write opencode.json at {opencode_path}: {e}")
 
+def get_parameter_size(model_name):
+    """Parses parameter size (e.g. 2, 4, 35) from a model name, avoiding 'bit' suffix."""
+    import re
+    sizes = []
+    # Match numbers followed by b or B
+    for m in re.finditer(r'(\d+(?:\.\d+)?)\s*[bB]', model_name):
+        val = m.group(1)
+        end = m.end()
+        # Exclude 'bit' suffixes
+        if end < len(model_name) and model_name[end].lower() == 'i':
+            continue
+        try:
+            sizes.append(float(val))
+        except ValueError:
+            pass
+    if sizes:
+        return min(sizes)
+    # If no b/B found, check any number
+    for m in re.finditer(r'(\d+(?:\.\d+)?)', model_name):
+        try:
+            sizes.append(float(m.group(1)))
+        except ValueError:
+            pass
+    if sizes:
+        return min(sizes)
+    return 999.0
+
+def write_junie_config(config, port=None):
+    """Automatically generates or updates Junie configuration profiles (.json)
+    for each enabled model to match the current port and API credentials.
+    Supports local (.junie/models/) and global (~/.junie/models/) targets.
+    """
+    port = port or config.get("proxy_port", 12500)
+    global_opencode = GLOBAL_OPENCODE_OVERRIDE if GLOBAL_OPENCODE_OVERRIDE is not None else config.get("global_opencode", False)
+    
+    local_dir = os.path.join(os.path.dirname(CONFIG_PATH), ".junie", "models")
+    global_dir = os.path.expanduser("~/.junie/models")
+    
+    # Check if HTTPS is configured and certs exist
+    ssl_certfile = config.get("ssl_certfile")
+    ssl_keyfile = config.get("ssl_keyfile")
+    use_https = ssl_certfile and ssl_keyfile and os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile)
+    scheme = "https" if use_https else "http"
+    base_url = f"{scheme}://127.0.0.1:{port}/v1"
+    
+    api_key = config.get("api_key")
+    
+    managed_servers = config.get("managed_servers", [])
+    active_models = []
+    model_configs = {}
+    
+    if isinstance(managed_servers, list):
+        for server in managed_servers:
+            if not isinstance(server, dict):
+                continue
+            repo_id = server.get("model")
+            if not repo_id:
+                continue
+            if server.get("enabled", False):
+                active_models.append(repo_id)
+                model_configs[repo_id] = {
+                    "temperature": server.get("temperature"),
+                    "faster_model": server.get("faster_model")
+                }
+                    
+    target_dirs = [local_dir]
+    if global_opencode:
+        target_dirs.append(global_dir)
+        
+    for d in target_dirs:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create directory {d}: {e}")
+            
+    # For each target directory:
+    for d in target_dirs:
+        if not os.path.exists(d):
+            continue
+            
+        # Clear/delete old mlx-*.json profiles that are no longer active
+        try:
+            for filename in os.listdir(d):
+                if filename.startswith("mlx-") and filename.endswith(".json"):
+                    model_profile_name = filename[:-5]
+                    is_still_active = False
+                    for active_m in active_models:
+                        safe_active = "mlx-" + active_m.split("/")[-1].lower()
+                        if safe_active == model_profile_name:
+                            is_still_active = True
+                            break
+                    if not is_still_active:
+                        file_to_remove = os.path.join(d, filename)
+                        os.remove(file_to_remove)
+                        logger.info(f"Removed inactive Junie profile: {file_to_remove}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old Junie profiles in {d}: {e}")
+            
+        # Write active profiles
+        for active_m in active_models:
+            model_slug = active_m.split("/")[-1].lower()
+            profile_filename = f"mlx-{model_slug}.json"
+            profile_path = os.path.join(d, profile_filename)
+            
+            m_config = model_configs.get(active_m, {})
+            temp = m_config.get("temperature")
+            faster_m = m_config.get("faster_model")
+            
+            profile_data = {
+                "baseUrl": base_url,
+                "id": active_m,
+                "apiType": "OpenAICompletion"
+            }
+            if api_key:
+                profile_data["apiKey"] = api_key
+                
+            if temp is not None:
+                profile_data["temperature"] = temp
+                
+            # Set primaryModel options
+            primary_conf = {
+                "id": active_m
+            }
+            if temp is not None:
+                primary_conf["temperature"] = temp
+            profile_data["primaryModel"] = primary_conf
+            
+            # Determine fasterModel (explicit config -> fallback to auto-detected smallest model)
+            chosen_faster = faster_m
+            if not chosen_faster:
+                size_current = get_parameter_size(active_m)
+                smaller_active = []
+                for other_m in active_models:
+                    if other_m != active_m:
+                        other_size = get_parameter_size(other_m)
+                        if other_size < size_current:
+                            smaller_active.append((other_size, other_m))
+                if smaller_active:
+                    # Sort by size to pick the smallest active model
+                    smaller_active.sort()
+                    chosen_faster = smaller_active[0][1]
+                    
+            if chosen_faster:
+                profile_data["fasterModel"] = {
+                    "id": chosen_faster
+                }
+                
+            write_needed = True
+            if os.path.exists(profile_path):
+                try:
+                    with open(profile_path, "r") as f:
+                        existing = json.load(f)
+                    if existing == profile_data:
+                        write_needed = False
+                except Exception:
+                    pass
+            if write_needed:
+                try:
+                    with open(profile_path, "w") as f:
+                        json.dump(profile_data, f, indent=2)
+                    logger.info(f"Generated/updated Junie configuration profile at: {profile_path}")
+                except Exception as e:
+                    logger.error(f"Failed to write Junie profile at {profile_path}: {e}")
+
 async def monitor_and_scan_loop(interval):
     """
     Background worker that runs continuously to:
@@ -266,6 +432,7 @@ async def monitor_and_scan_loop(interval):
         while True:
             config = load_config()
             write_opencode_config(config)
+            write_junie_config(config)
             managed_servers = config.get("managed_servers", [])
             if not isinstance(managed_servers, list):
                 logger.warning("Config error: 'managed_servers' must be a list in config.json.")
@@ -979,8 +1146,9 @@ def run_server(port_override=None, global_opencode=False, debug=False):
     config = load_config()
     port = port_override or config.get("proxy_port", 12500)
     
-    # Auto-generate/update opencode.json matching the config
+    # Auto-generate/update configs matching the config
     write_opencode_config(config, port)
+    write_junie_config(config, port)
     
     # Run memory limit diagnostics before startup
     check_memory_limits(config)

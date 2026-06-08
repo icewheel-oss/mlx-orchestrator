@@ -99,6 +99,9 @@ When you first run the server, a default `config.json` will be generated in your
 * **Types:** Use `"lm"` or `"vlm"` depending on the model's architecture:
   * **`lm` (Language Model):** Text-only models. Runs under the `mlx-lm` backend wrapper. Best for coding, text chat, and reasoning (e.g. Qwen 3.6, Llama 3.1, DeepSeek Distill).
   * **`vlm` (Vision-Language Model):** Multimodal/vision-enabled models. Runs under the `mlx-vlm` backend wrapper. Necessary for analyzing screenshots, photos, and diagrams (e.g. Gemma 4, Llama 3.2 Vision).
+* **Model-Specific Integration Parameters (for Junie profiles):**
+  * **`temperature`:** Optional number (e.g. `0.3`). Custom sampling temperature to write into the Junie profile.
+  * **`faster_model`:** Optional string. Explicit model ID to use as the `"fasterModel"` role in Junie. If omitted, the orchestrator automatically detects and selects the smallest enabled model (whose parameter size is smaller than the current model) as the helper!
 
 ### 4. Run the Orchestrator
 Start the main gateway:
@@ -131,6 +134,24 @@ Now, configure your client applications (like OpenCode or Goose) to point to the
    - Open the **AI Chat window** inside IntelliJ IDEA.
    - Choose **OpenCode Agent** from the list of agents.
    - The agent will connect to your local MLX Orchestrator, dynamically listing all of your active models!
+
+### 🤖 Junie Integration
+
+JetBrains Junie is a terminal-based AI assistant. The orchestrator automatically generates and updates JSON profiles for Junie to let you chat with your active local models:
+
+1. **Auto-Generated Profiles:**
+   Running the orchestrator server automatically generates `.json` profile files for each enabled model under `.junie/models/` in your project directory.
+   *(This synchronizes the `baseUrl`, API type (`OpenAICompletion`), and keys. If `"global_opencode": true` is configured or the `--global-opencode` CLI flag is passed, it will also write these profiles globally at `~/.junie/models/` so they are available system-wide).*
+
+2. **Cleaning Inactive Models:**
+   The orchestrator dynamically cleans up old generated model profiles from local and global directories when they are disabled in `config.json`, so they don't clutter your model selection.
+
+3. **Using Custom Profiles in Junie:**
+   Run the `junie` CLI pointing to the generated model profile. Custom models are referenced with the `custom:` prefix followed by the profile filename (without the `.json` extension):
+   ```bash
+   # Run Junie with the local Qwen model profile
+   junie --model custom:mlx-qwen3.6-35b-a3b-4bit
+   ```
 ---
 
 ## 🛠️ CLI Commands
