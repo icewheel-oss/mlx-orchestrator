@@ -183,6 +183,8 @@ When diagnosing connection errors, custom client configurations, or token-genera
   - **Downstream Responses:** Logs HTTP response status code, response headers, and non-streaming response body.
   - **Real-Time Stream Chunks:** Prints individual event-stream chunks (e.g., `data: {...}`) as they arrive from downstream servers.
   - **Uvicorn Access Logs:** Automatically enables `access_log` in Uvicorn to trace every HTTP transaction.
+  
+All of these details are logged to both the terminal stdout and the `logs/orchestrator.log` file.
 
 ### 3. Automated Log Rotation & In-Place Active Truncation
 Because running large language models generates substantial output logs during load and evaluation, MLX Orchestrator prevents log files from consuming all your disk space:
@@ -203,7 +205,7 @@ The orchestrator reads and updates its state from [config.json](file:///Users/to
 ## 🗂️ Logs
 
 The MLX Orchestrator separates its logs to keep your terminal output readable:
-1. **Gateway Logs (Terminal stdout):** Shows orchestrator startup, configuration updates, active port scans, API routing targets, request forwarding, token usage statistics, and debug output.
+1. **Gateway Logs (Terminal stdout & `logs/orchestrator.log`):** Shows orchestrator startup, configuration updates, active port scans, API routing targets, request forwarding, token usage statistics, and debug output (including full request/response JSON details).
 2. **Model Process Logs (`logs/` directory):** The raw stdout and stderr outputs of each managed backend subprocess are routed to dedicated files under `logs/`.
    - File format: `logs/<org>_<model_name>.log` (e.g., `logs/mlx-community_Qwen3.6-35B-A3B-4bit.log`).
    - If a model fails to start or crashes, **always check these files first** to see the python traceback from the underlying server wrapper.

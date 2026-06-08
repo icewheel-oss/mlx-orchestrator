@@ -40,6 +40,30 @@ LOGS_DIR = os.path.join(BASE_DIR, "logs")
 # Ensure logs directory exists
 os.makedirs(LOGS_DIR, exist_ok=True)
 
+# Set up orchestrator file logging
+orchestrator_log_path = os.path.join(LOGS_DIR, "orchestrator.log")
+
+# Rotate orchestrator.log on startup if it exceeds 10MB
+try:
+    if os.path.exists(orchestrator_log_path) and os.path.getsize(orchestrator_log_path) > 10 * 1024 * 1024:
+        backup_path = orchestrator_log_path + ".1"
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.rename(orchestrator_log_path, backup_path)
+except Exception as e:
+    print(f"Warning: Failed to rotate orchestrator log file: {e}", file=sys.stderr)
+
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    
+    # File Handler
+    try:
+        file_handler = logging.FileHandler(orchestrator_log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Warning: Failed to set up orchestrator log file handler: {e}", file=sys.stderr)
+
 # Default generic configuration structure
 DEFAULT_CONFIG = {
     "proxy_port": 12500,
@@ -365,6 +389,14 @@ async def monitor_and_scan_loop(interval):
             new_routes = {}
             new_models = {}
             
+            # Map port -> configured model name from config
+            port_to_model = {}
+            for server in managed_servers:
+                p = server.get("port")
+                m_name = server.get("model")
+                if p is not None and m_name:
+                    port_to_model[p] = m_name
+            
             scan_min = config.get("scan_ports_min", 12501)
             scan_max = config.get("scan_ports_max", 12520)
             
@@ -378,11 +410,33 @@ async def monitor_and_scan_loop(interval):
                     if response.status_code == 200:
                         data = response.json()
                         models = data.get("data", [])
-                        for m in models:
-                            model_id = m.get("id")
-                            if model_id:
-                                new_routes[model_id] = backend_url
-                                new_models[model_id] = m
+                        
+                        configured_model = port_to_model.get(port)
+                        if configured_model:
+                            # If this port is configured for a specific model, we ONLY map that model to this port
+                            model_meta = None
+                            for m in models:
+                                if m.get("id") == configured_model:
+                                    model_meta = m
+                                    break
+                            
+                            # Use found metadata, or fallback to standard structure if metadata is missing
+                            if not model_meta:
+                                model_meta = {
+                                    "id": configured_model,
+                                    "object": "model",
+                                    "created": int(time.time())
+                                }
+                            new_routes[configured_model] = backend_url
+                            new_models[configured_model] = model_meta
+                        else:
+                            # For unmanaged/external ports (not in config.json), we map the models returned,
+                            # but we do NOT overwrite or claim any model IDs configured on our managed ports.
+                            for m in models:
+                                model_id = m.get("id")
+                                if model_id and model_id not in port_to_model.values():
+                                    new_routes[model_id] = backend_url
+                                    new_models[model_id] = m
                 except Exception:
                     pass
             
@@ -919,8 +973,8 @@ def recommend_models():
 def run_server(port_override=None, global_opencode=False, debug=False):
     """Launches the orchestrator proxy server with optional SSL/HTTPS."""
     global GLOBAL_OPENCODE_OVERRIDE, GLOBAL_DEBUG_OVERRIDE
-    GLOBAL_OPENCODE_OVERRIDE = global_opencode
-    GLOBAL_DEBUG_OVERRIDE = debug
+    GLOBAL_OPENCODE_OVERRIDE = True if global_opencode else None
+    GLOBAL_DEBUG_OVERRIDE = True if debug else None
     
     config = load_config()
     port = port_override or config.get("proxy_port", 12500)
